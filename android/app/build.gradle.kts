@@ -3,6 +3,7 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
     id("com.google.devtools.ksp")
 }
 
@@ -103,6 +104,12 @@ android {
         buildConfig = true
     }
 
+    // Stub out android.* method calls (Log.i, etc.) to default values for pure-JVM unit tests so
+    // tests can exercise classes that touch the framework without dragging in Robolectric.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     composeOptions {
         // Compose Compiler extension matched to Kotlin 1.9.24 (see the official
         // Compose-to-Kotlin compatibility map). Bumping Kotlin requires bumping this.
@@ -147,6 +154,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
+    // --- Serialization (UnifiedAlarmStore JSON, etc.) ---
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+
     // --- Room (local-only persistence; on-device, nothing leaves the phone) ---
     val roomVersion = "2.6.1"
     implementation("androidx.room:room-runtime:$roomVersion")
@@ -166,9 +176,14 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     testImplementation("org.json:json:20240303") // real org.json for JVM unit tests (android.jar ships throwing stubs)
     testImplementation("net.sf.kxml:kxml2:2.3.0") // real XmlPullParser for JVM tests (android.util.Xml is a throwing stub)
+    testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
+    testImplementation("org.mockito:mockito-inline:5.2.0") // static method mocking for PendingIntent.getBroadcast
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+
+    // Compose drag-reorder for the alarm list
+    implementation("sh.calvin.reorderable:reorderable:2.4.2")
 
     // --- Compose tooling (debug-only) ---
     debugImplementation("androidx.compose.ui:ui-tooling")

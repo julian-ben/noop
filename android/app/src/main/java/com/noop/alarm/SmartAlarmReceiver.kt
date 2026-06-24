@@ -23,46 +23,75 @@ import com.noop.ui.appLaunchIntent
  * the notification to a heads-up / full-screen alarm. This path is reached whether the alarm fired at
  * the smart (light-sleep) time or the hard deadline, so the user is woken either way.
  *
- * Registered in the manifest (exported=false) so it survives the app being killed. After firing it
- * clears the persisted schedule (a one-shot alarm), then re-arms the strap-independent fallback for
- * the NEXT day only when the watcher / app re-arms it — we do not silently re-schedule here, so a
- * disabled-then-fired alarm doesn't resurrect itself.
+ * Registered in the manifest (exported=false) so it survives the app being killed. Unified phone
+ * alarms carry their alarm id, so after one fires we resolve the next occurrence from
+ * [UnifiedAlarmStore] instead of re-entering the retired legacy scheduler.
  */
 class SmartAlarmReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action != SmartAlarmScheduler.ACTION_FIRE) return
         val smart = intent.getBooleanExtra(SmartAlarmScheduler.EXTRA_SMART, false)
+        val alarmId = intent.getStringExtra(SnoozeReceiver.EXTRA_ALARM_ID) ?: ""
+        val deadline = intent.getLongExtra(SmartAlarmScheduler.EXTRA_DEADLINE_MS, 0L)
 
-        // Clear the schedule we just fired so a boot right after firing doesn't re-raise THIS one...
-        val store = SmartAlarmStore.from(context)
-        store.scheduledDeadlineMs = 0L
-        store.scheduledWindowStartMs = 0L
-        // ...then, if the alarm is still enabled, re-arm the GUARANTEED deadline for the NEXT day so
-        // the smart alarm recurs each morning. arm() computes the next occurrence (tomorrow, since
-        // today's just passed). A disabled-but-fired alarm does NOT resurrect itself.
-        runCatching { if (store.enabled) SmartAlarmScheduler.arm(context, store) }
+        runCatching {
+            UnifiedAlarmMigration.migrateIfNeeded(context)
+            if (alarmId.isNotBlank()) {
+                val resolvedNow = maxOf(System.currentTimeMillis(), deadline)
+                UnifiedPhoneScheduler.recompute(context, UnifiedAlarmStore.from(context), resolvedNow)
+            } else {
+                val store = SmartAlarmStore.from(context)
+                store.scheduledDeadlineMs = 0L
+                store.scheduledWindowStartMs = 0L
+                store.scheduledAlarmId = null
+                if (!UnifiedAlarmStore.from(context).migrationComplete && store.enabled) {
+                    SmartAlarmScheduler.arm(context, store)
+                }
+            }
+        }
 
         ensureChannel(context)
         // Defensive: a notify() throw (OEM quirk / revoked POST_NOTIFICATIONS) must not crash the
         // broadcast. The system alarm sound below is the fallback-of-the-fallback audible cue.
         runCatching {
             val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            mgr.notify(NOTIF_ID, buildNotification(context, smart))
+            mgr.notify(NOTIF_ID, buildNotification(context, smart, alarmId, deadline))
         }
     }
 
-    private fun buildNotification(context: Context, smart: Boolean): Notification {
+    private fun buildNotification(
+        context: Context,
+        smart: Boolean,
+        alarmId: String = "",
+        deadlineMs: Long = 0L,
+    ): Notification {
         val fullScreen = PendingIntent.getActivity(
             context, 0, appLaunchIntent(context),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val title = "Good morning"
         val body = if (smart) {
-            "You're in a lighter sleep phase — time to wake up."
+            "You're in a lighter sleep phase - time to wake up."
         } else {
-            "Your wake window has ended — time to get up."
+            "Your wake window has ended - time to get up."
         }
+        val snoozeIntent = android.content.Intent(context, SnoozeReceiver::class.java)
+            .setAction(SnoozeReceiver.ACTION_SNOOZE)
+            .putExtra(SnoozeReceiver.EXTRA_ALARM_ID, alarmId)
+            .putExtra(SmartAlarmScheduler.EXTRA_DEADLINE_MS, deadlineMs)
+        val snoozePi = PendingIntent.getBroadcast(
+            context, ("snooze-action:$alarmId").hashCode(), snoozeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val dismissIntent = android.content.Intent(context, SnoozeReceiver::class.java)
+            .setAction(SnoozeReceiver.ACTION_DISMISS)
+            .putExtra(SnoozeReceiver.EXTRA_ALARM_ID, alarmId)
+            .putExtra(SmartAlarmScheduler.EXTRA_DEADLINE_MS, deadlineMs)
+        val dismissPi = PendingIntent.getBroadcast(
+            context, ("dismiss-action:$alarmId").hashCode(), dismissIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         return NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_heart)
             .setContentTitle(title)
@@ -74,6 +103,8 @@ class SmartAlarmReceiver : BroadcastReceiver() {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(true)
             .setOngoing(true)
+            .addAction(0, "Snooze", snoozePi)
+            .addAction(0, "Dismiss", dismissPi)
             .build()
     }
 
@@ -109,6 +140,6 @@ class SmartAlarmReceiver : BroadcastReceiver() {
 
     companion object {
         const val CHANNEL_ID = "noop_smart_alarm"
-        private const val NOTIF_ID = 4307
+        internal const val NOTIF_ID = 4307
     }
 }

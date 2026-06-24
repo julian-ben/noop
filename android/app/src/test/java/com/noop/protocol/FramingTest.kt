@@ -322,6 +322,8 @@ class FramingTest {
     fun enums_fromRawRoundTrip() {
         assertEquals(PacketType.REALTIME_DATA, PacketType.fromRaw(40))
         assertEquals(EventNumber.BATTERY_LEVEL, EventNumber.fromRaw(3))
+        assertEquals(EventNumber.STRAP_DRIVEN_ALARM_DISABLED, EventNumber.fromRaw(59))
+        assertEquals(EventNumber.HAPTICS_TERMINATED, EventNumber.fromRaw(100))
         assertEquals(MetadataType.HISTORY_END, MetadataType.fromRaw(2))
         assertEquals(CommandNumber.RUN_HAPTICS_PATTERN, CommandNumber.fromRaw(79))
         assertNull(PacketType.fromRaw(999))

@@ -2,13 +2,25 @@ package com.noop
 
 import android.app.Application
 import android.util.Log
+import com.noop.alarm.SmartAlarmCoordinator
+import com.noop.alarm.SmartAlarmScheduler
+import com.noop.alarm.SmartAlarmStore
+import com.noop.alarm.StrapArmer
+import com.noop.alarm.UnifiedAlarmMigration
+import com.noop.alarm.UnifiedAlarmStore
+import com.noop.alarm.UnifiedPhoneScheduler
 import com.noop.ble.SourceCoordinator
 import com.noop.ble.WhoopBleClient
 import com.noop.data.DeviceRegistry
 import com.noop.data.WhoopDatabase
 import com.noop.data.WhoopRepository
 import com.noop.ui.NoopPrefs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.time.ZoneId
 
 /**
  * Application entry point.
@@ -25,11 +37,68 @@ import kotlinx.coroutines.runBlocking
  */
 class NoopApplication : Application() {
 
+    /**
+     * Application-level coroutine scope. Alive for the life of the process - used to observe
+     * [unifiedAlarmStore].alarms and recompute the coordinator on any list change (trigger 1 of 4
+     * per the coordinator spec). Never cancelled — the process exit cleans up.
+     */
+    val applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Process-wide unified alarm store. Owned here so the BLE service and the UI share the exact
+     * same instance and the coordinator is the single writer of armed state.
+     */
+    lateinit var unifiedAlarmStore: UnifiedAlarmStore
+        private set
+
+    /**
+     * Process-wide smart alarm coordinator. Sole owner of arm/disable + AlarmManager calls. All
+     * four triggers (list change, BLE connect, midnight, smart-wake fire) funnel through
+     * [SmartAlarmCoordinator.recompute] or [SmartAlarmCoordinator.onSmartWakeFire].
+     */
+    lateinit var smartAlarmCoordinator: SmartAlarmCoordinator
+        private set
+
     override fun onCreate() {
         super.onCreate()
         // Record any uncaught crash to a file so it rides along in the shareable strap log — a
         // device-specific crash (e.g. Insights #224/#267) is otherwise lost to an unreachable logcat.
         CrashCapture.install(this)
+
+        // Smart Alarm (#207 v2): one-shot copy of the two legacy alarm stores into
+        // [UnifiedAlarmStore]. Idempotent. All migration code is in one file for future deletion.
+        UnifiedAlarmMigration.migrateIfNeeded(applicationContext)
+        // The legacy single-slot phone alarm is retired once the unified store exists. Cancel its
+        // fixed PendingIntent so migrated users do not get a duplicate wake beside the per-id one-shot.
+        SmartAlarmScheduler.cancel(applicationContext, SmartAlarmStore.from(applicationContext))
+        val store = UnifiedAlarmStore.from(applicationContext)
+
+        val strapArmer = object : StrapArmer {
+            override fun armAt(epochSec: Long) { ble.armStrapAlarm(epochSec) }
+            override fun disable() { ble.disableStrapAlarm() }
+        }
+
+        val phoneScheduler = UnifiedPhoneScheduler(this, store)
+
+        val coordinator = SmartAlarmCoordinator(
+            context = this,
+            store = store,
+            nowEpochMs = { System.currentTimeMillis() },
+            zone = ZoneId.systemDefault(),
+            strapArmer = strapArmer,
+            phoneScheduler = phoneScheduler,
+        )
+
+        unifiedAlarmStore = store
+        smartAlarmCoordinator = coordinator
+
+        // Trigger 1: any alarm list change re-runs the coordinator so arm/disable/schedule stays
+        // in sync without the UI having to manually call recompute after every mutation.
+        // StateFlow is conflated and already drops duplicates via operator fusion, so two quick
+        // writes that resolve to the same list value emit only once.
+        applicationScope.launch {
+            store.alarms.collect { coordinator.recompute() }
+        }
     }
 
     /** Process-wide Room-backed store. One instance shared by the UI and the background service. */
@@ -76,7 +145,7 @@ class NoopApplication : Application() {
      * Multi-WHOOP identity adoption: AppViewModel's init collects [WhoopBleClient.connectedPeripheralAddress]
      * (distinctUntilChanged) into [SourceCoordinator.connectedPeripheralChanged] — the Kotlin analogue of
      * macOS wiring `BLEManager.connectedPeripheralUUID` into the coordinator's adoption sink. Kept beside
-     * the other `ble`-flow collectors there (this Application owns no CoroutineScope of its own).
+     * the other `ble`-flow collectors there (see AppViewModel init).
      */
     val sourceCoordinator: SourceCoordinator by lazy {
         SourceCoordinator(

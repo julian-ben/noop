@@ -658,6 +658,14 @@ class WhoopBleClient(
             event.startsWith("STRAP_DRIVEN_ALARM_EXECUTED") && !replayedOffload
 
         /**
+         * True for the alarm-specific firmware disabled event after a live strap alarm. HAPTICS_TERMINATED
+         * is deliberately not treated as dismissal: it is a generic haptic motor lifecycle event and can
+         * also follow notifications, test buzzes, or any other haptic pattern.
+         */
+        fun smartAlarmDismissedForEvent(event: String, replayedOffload: Boolean): Boolean =
+            event.startsWith("STRAP_DRIVEN_ALARM_DISABLED") && !replayedOffload
+
+        /**
          * H3 (#520): the LiveState the device-remove RELEASE publishes — the link fully dropped + every
          * stale live readout cleared, so a removed strap can't keep showing live HR / a bond / a charging
          * pill. Pure model of what [releaseStrap] applies, so a test can assert the released state without a
@@ -954,6 +962,9 @@ class WhoopBleClient(
      *  Fired from the NON-gesture EVENT branch: event 57 is NOT a gesture, so routing it through the
      *  gesture path (freshness-gated, gesture `when`) would swallow it entirely. */
     var onSmartAlarmFired: (() -> Unit)? = null
+
+    /** Invoked (live only) when the strap reports its firmware alarm was disabled/dismissed. */
+    var onSmartAlarmDismissed: (() -> Unit)? = null
 
     /** In-memory ring buffer of the strap log so it can be exported from the UI for bug reports.
      *  `log()` always writes here (under [logBuffer]'s monitor); logcat mirroring is opt-in via
@@ -2913,6 +2924,10 @@ class WhoopBleClient(
                         if (smartAlarmFiredForEvent(ev, replayedOffload)) {
                             log("Strap fired its smart alarm (event 57) — re-arming the next day's instant")
                             onSmartAlarmFired?.invoke()
+                        }
+                        if (smartAlarmDismissedForEvent(ev, replayedOffload)) {
+                            log("Strap disabled/dismissed its smart alarm (event 59) - cancelling phone backup")
+                            onSmartAlarmDismissed?.invoke()
                         }
                     } else {
                         // Physical inputs — LIVE ONLY. handleFrame runs for EVERY frame (live AND during a
